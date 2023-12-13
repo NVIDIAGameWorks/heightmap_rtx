@@ -1,0 +1,154 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#version 460
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+//#extension GL_EXT_debug_printf : enable
+
+#include "shader_definitions.h"
+
+// Would be nice to make this pluggable
+float sampleHeight(sampler2D heightmap, uvec3 triangleIndices, vec3 baryCoord, vec2 textureCoord);
+#include "sample_default.h"
+
+layout(local_size_x = COMPRESS_WORKGROUP_SIZE) in;
+
+struct BaryUV16
+{
+  uint8_t u;
+  uint8_t v;
+};
+
+layout(set = 0, binding = BINDING_COMPRESS_BIRD_TABLE, scalar) uniform BlockToBirdUVTable
+{
+  BaryUV16 blockToBirdUVTable[970];
+};
+
+layout(set = 1, binding = BINDING_COMPRESS_HEIGHTMAP) uniform sampler2D heightmap;
+
+layout(push_constant) uniform CompressPushConstants_
+{
+  CompressPushConstants pc;
+};
+
+struct VkMicromapTriangleEXT
+{
+  uint32_t dataOffset;
+  uint16_t subdivisionLevel;
+  uint16_t format;
+};
+
+// clang-format off
+layout(buffer_reference, scalar) readonly buffer TexCoords    { vec2 v[]; };
+layout(buffer_reference, scalar) readonly buffer Indices      { uvec3 i[]; };
+layout(buffer_reference, scalar) buffer BaryValues            { uint d[]; };
+layout(buffer_reference, scalar) buffer BaryTriangles         { VkMicromapTriangleEXT t[]; };
+// clang-format on
+
+// Barycentric interpolation
+vec2 baryMix(vec2 a, vec2 b, vec2 c, vec3 baryCoord)
+{
+  return a * baryCoord.x + b * baryCoord.y + c * baryCoord.z;
+}
+
+// Returns the global barycentric coordinates within a triangle given the bird
+// curve index of a microvertex within a compression block. Up to subdivision
+// level 5 is supported.
+// - Subdivision level 0 to 3 (inclusive) are straight lookups into
+//   blockToBirdUVTable (computed by BlockToBirdUVTable in hrtx_pipeline.hpp
+//   from tables in bird_curve_table.h).
+// - Subdivision level 4 starts at the expected offset, but has 4 blocks of 45
+//   vertices instead of 1 block of 153 vertices.
+// - Subdivision level 5 has 16 blocks of 45 vertices instead of 1 block of 561
+//   vertices.
+vec3 blockMicroVertBaryCoord(uint triangleBlockIndex, uint blockMicroVert, uint subdivisionLevel)
+{
+  const uint birdToBaryOffsets[6] = uint[6](0, 3, 9, 24, 69, 249);
+  uint       birdToBaryOffset     = birdToBaryOffsets[min(5U, subdivisionLevel)];
+  uint       baryMax              = 1U << subdivisionLevel;
+  BaryUV16   baryCoordUV          = blockToBirdUVTable[birdToBaryOffset + triangleBlockIndex * 45 + blockMicroVert];
+  vec3       baryCoord            = vec3(baryMax - baryCoordUV.u - baryCoordUV.v, baryCoordUV.u, baryCoordUV.v);
+  return baryCoord / float(baryMax);
+}
+
+void main()
+{
+  // Find job count per compression block
+  uint microVertsPerBlockL3  = 45;
+  uint blocksPerTriangle     = 1U << ((max(3, pc.subdivisionLevel) - 3) * 2);
+  uint microVertsPerEdge     = (1U << pc.subdivisionLevel) + 1;
+  uint microVertsPerTriangle = (microVertsPerEdge * (microVertsPerEdge + 1)) / 2;
+  uint microVertsPerBlock    = min(microVertsPerBlockL3, microVertsPerTriangle);
+
+  // Each thread operates on a microvertex for each compression block for all base triangles.
+  // Exit if COMPRESS_WORKGROUP_SIZE does not divide total microvertices equally.
+  if(gl_GlobalInvocationID.x >= pc.triangleCount * blocksPerTriangle * microVertsPerBlock)
+    return;
+
+  // Compression block index and the microvertex index within it. The microvertex
+  // index is in bird curve order up to the per-block maximum of 45 (subdiv 3).
+  uint blockIndex         = gl_GlobalInvocationID.x / microVertsPerBlock;
+  uint blockMicroVert     = gl_GlobalInvocationID.x - blockIndex * microVertsPerBlock;
+  uint triangleIndex      = blockIndex / blocksPerTriangle;
+  uint triangleBlockIndex = blockIndex - triangleIndex * blocksPerTriangle;
+  bool firstMicroVert     = triangleBlockIndex == 0 && blockMicroVert == 0;
+
+  // Find the bary coordinate of the block's microvertex relative to the base
+  // triangle. This is not straightforward as multiple block microvertices can
+  // map to the same global microvertex as they share edges.
+  vec3 baryCoord = blockMicroVertBaryCoord(triangleBlockIndex, blockMicroVert, pc.subdivisionLevel);
+
+  // Interpolate texture coordinates with baryCoord and sample the heightmap to
+  // find the microvertex's displacement
+  Indices   indices   = Indices(pc.triangleIndices);
+  uvec3     triangle  = indices.i[triangleIndex];
+  TexCoords texCoords = TexCoords(pc.vertexTexCoords);
+  vec2      texCoord  = baryMix(texCoords.v[triangle.x * pc.vertexTexCoordsStrideVec2],
+                                texCoords.v[triangle.y * pc.vertexTexCoordsStrideVec2],
+                                texCoords.v[triangle.z * pc.vertexTexCoordsStrideVec2],
+                                baryCoord);
+  float     displacement = sampleHeight(heightmap, triangle, baryCoord, texCoord).x;
+  uint      displacementUnorm11 = clamp(uint(displacement * float(0x7FFU)), 0x0U, 0x7FFU);
+
+  // Write the displacement as tightly packed UNORM11 values.
+  uint       blockOffset = blockIndex * 64U;
+  uint       offsetBits  = blockMicroVert * 11U;
+  uint       shift       = offsetBits % 32;
+  uint       offsetWords = blockOffset / 4U + offsetBits / 32;
+  BaryValues baryValues  = BaryValues(pc.baryValues);
+  atomicOr(baryValues.d[offsetWords], displacementUnorm11 << shift);
+  if(shift > 0)
+  {
+    atomicOr(baryValues.d[offsetWords + 1], displacementUnorm11 >> (32 - shift));
+  }
+
+  // Write the base triangle metadata with first thread of each triangle
+  const uint VK_DISPLACEMENT_MICROMAP_FORMAT_64_TRIANGLES_64_BYTES_NV = 1;
+  if(firstMicroVert)
+  {
+    BaryTriangles baryTriangles                     = BaryTriangles(pc.baryTriangles);
+    baryTriangles.t[triangleIndex].dataOffset       = triangleIndex * blocksPerTriangle * 64U;
+    baryTriangles.t[triangleIndex].subdivisionLevel = uint16_t(pc.subdivisionLevel);
+    baryTriangles.t[triangleIndex].format = uint16_t(VK_DISPLACEMENT_MICROMAP_FORMAT_64_TRIANGLES_64_BYTES_NV);
+  }
+}
