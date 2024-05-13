@@ -102,7 +102,6 @@ typedef struct HrtxMapCreate
   VkDeviceOrHostAddressConstKHR textureCoordsBuffer;
   VkFormat                      textureCoordsFormat;
   VkDeviceSize                  textureCoordsStride;
-  // Currently only VK_FORMAT_R16G16B16A16_SFLOAT is supported
   VkDeviceOrHostAddressConstKHR directionsBuffer;
   VkFormat                      directionsFormat;
   VkDeviceSize                  directionsStride;

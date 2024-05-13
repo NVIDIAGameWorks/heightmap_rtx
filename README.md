@@ -88,9 +88,9 @@ HrtxMapCreate  mapCreate{
     geometry.vertexTexcoordBuffer.address,
     VK_FORMAT_R32G32_SFLOAT,
     sizeof(float) * 2,
-    geometry.vertexNormalBufferHVec4.address,
-    VK_FORMAT_R16G16B16A16_SFLOAT,
-    sizeof(uint16_t) * 4,
+    geometry.vertexNormalBuffer.address,  // displacement directions
+    VK_FORMAT_R32G32B32_SFLOAT,
+    sizeof(float) * 3,
     heightmapImageInfo,
     heightmapBias,
     heightmapScale,
